@@ -4,6 +4,7 @@
 use std::io::BufRead;
 
 use transport::error::{Result, TransportError, classify, protocol_error};
+use transport::wire::MAX_BODY;
 
 /// One status line.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,56 +57,21 @@ pub fn expect_ok(reader: &mut impl BufRead, what: &str) -> Result<Status> {
     }
 }
 
-/// Read a multi-line response up to and excluding the terminating dot, a
-/// leading dot on any line un-stuffed. Lines are joined with CRLF and none
-/// trails, the same shape `xmip-core-transport-smtp` reads DATA into: mail
-/// carries lines, and a message is its lines.
+/// Read a multi-line response: the dot-stuffed block up to its terminator,
+/// bytes as the server wrote them — the same block SMTP's DATA is, from
+/// `transport::stuffed` since 2026-09-10.
 ///
 /// # Errors
 /// A connection that closes before the terminating dot.
 pub fn read_multiline(reader: &mut impl BufRead) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut first = true;
-    loop {
-        let mut line = Vec::new();
-        let read = reader
-            .read_until(b'\n', &mut line)
-            .map_err(|e| classify("reading a multi-line response", &e))?;
-        if read == 0 {
-            return Err(protocol_error("the response ended before its dot"));
-        }
-        let body = strip_ending(&line);
-        if body == b"." {
-            return Ok(out);
-        }
-        if !first {
-            out.extend_from_slice(b"\r\n");
-        }
-        first = false;
-        out.extend_from_slice(body.strip_prefix(b".").unwrap_or(body));
-    }
+    transport::stuffed::read_stuffed(reader, MAX_BODY)
 }
 
-/// `bytes` as a multi-line response body: every line CRLF-terminated, a
-/// leading dot stuffed, and the terminating dot after.
+/// `bytes` as a multi-line response body: the dot-stuffed block, terminator
+/// included.
 #[must_use]
 pub fn write_multiline(bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bytes.len() + 8);
-    for line in bytes.split(|b| *b == b'\n') {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if line.starts_with(b".") {
-            out.push(b'.');
-        }
-        out.extend_from_slice(line);
-        out.extend_from_slice(b"\r\n");
-    }
-    out.extend_from_slice(b".\r\n");
-    out
-}
-
-fn strip_ending(line: &[u8]) -> &[u8] {
-    let line = line.strip_suffix(b"\n").unwrap_or(line);
-    line.strip_suffix(b"\r").unwrap_or(line)
+    transport::stuffed::stuff(bytes)
 }
 
 #[cfg(test)]
