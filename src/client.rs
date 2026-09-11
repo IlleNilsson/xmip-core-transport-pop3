@@ -31,7 +31,16 @@ impl Client {
     /// Where the server could not be reached, did not greet, or refused the
     /// login — a maildrop another session holds refuses here.
     pub fn connect(server: &str, login: &Login, timeout: Option<Duration>) -> Result<Self> {
-        let stream = socket::connect_tcp(server, timeout)?;
+        Self::over(socket::connect_tcp(server, timeout)?, login)
+    }
+
+    /// Log in over an already-open connection, the server's greeting still
+    /// to read — the loopback's collector, which takes the connection the
+    /// maildrop made to it.
+    ///
+    /// # Errors
+    /// Where the server did not greet or refused the login.
+    pub fn over(stream: TcpStream, login: &Login) -> Result<Self> {
         let (reader, writer) = socket::split(stream)?;
         let mut client = Self { reader, writer };
         expect_ok(&mut client.reader, "the greeting")?;
