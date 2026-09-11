@@ -33,6 +33,15 @@ impl Session {
         timeout: Option<Duration>,
     ) -> Result<Self> {
         let (stream, _) = socket::accept_tcp(listener, timeout)?;
+        Self::over(stream, messages)
+    }
+
+    /// Greet a client over an already-open connection and serve `messages`
+    /// to it — the loopback's maildrop, which connects to its collector.
+    ///
+    /// # Errors
+    /// Where the connection could not be split or greeted.
+    pub fn over(stream: TcpStream, messages: Vec<Vec<u8>>) -> Result<Self> {
         let (reader, writer) = socket::split(stream)?;
         let deleted = vec![false; messages.len()];
         let mut session = Self {

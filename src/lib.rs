@@ -26,7 +26,8 @@ use std::time::Duration;
 
 pub use client::{Client, Login};
 pub use session::Session;
-use transport::error::Result;
+use transport::error::{Result, protocol_error};
+use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
 use transport::{Arrived, Artefact, Claimed, Directions, ResourceClaim, Transport};
 
@@ -35,6 +36,7 @@ use transport::{Arrived, Artefact, Claimed, Directions, ResourceClaim, Transport
 /// A claim over a whole maildrop rather than one message, because that is
 /// what POP3 offers. `is_available` asks by trying to log in, which is the
 /// only question the protocol answers.
+#[derive(Clone)]
 pub struct MaildropLock {
     server: String,
     login: Login,
@@ -62,6 +64,7 @@ impl ResourceClaim for MaildropLock {
     }
 }
 
+#[derive(Clone)]
 pub struct Pop3Transport {
     server: String,
     delete_after_retrieve: bool,
@@ -122,6 +125,22 @@ impl Pop3Transport {
     pub fn accept_one(&self, listener: &TcpListener, messages: Vec<Vec<u8>>) -> Result<Session> {
         Session::accept(listener, messages, self.lock.timeout)
     }
+
+    /// Every message the logged-in client's maildrop holds, each deleted at
+    /// QUIT unless the transport was told to leave them; `server` names the
+    /// origin.
+    fn collect(&self, mut client: Client, server: &str) -> Result<Vec<Arrived>> {
+        let mut arrived = Vec::new();
+        for number in client.numbers()? {
+            let bytes = client.retrieve(number)?;
+            if self.delete_after_retrieve {
+                client.delete(number)?;
+            }
+            arrived.push(Arrived::new(format!("pop3://{server}/msg/{number}"), bytes));
+        }
+        client.quit()?;
+        Ok(arrived)
+    }
 }
 
 impl Transport for Pop3Transport {
@@ -136,20 +155,7 @@ impl Transport for Pop3Transport {
     /// Every message in the maildrop, each deleted at QUIT unless the
     /// transport was told to leave them.
     fn receive(&self) -> Result<Vec<Arrived>> {
-        let mut client = self.connect()?;
-        let mut arrived = Vec::new();
-        for number in client.numbers()? {
-            let bytes = client.retrieve(number)?;
-            if self.delete_after_retrieve {
-                client.delete(number)?;
-            }
-            arrived.push(Arrived::new(
-                format!("pop3://{}/msg/{number}", self.server),
-                bytes,
-            ));
-        }
-        client.quit()?;
-        Ok(arrived)
+        self.collect(self.connect()?, &self.server)
     }
 
     fn send(&self, _target: &str, _bytes: &[u8]) -> Result<()> {
@@ -163,6 +169,75 @@ impl Transport for Pop3Transport {
     }
 }
 
+impl Pop3Transport {
+    /// Both ends on this machine: an ephemeral local port, a probe login,
+    /// the loopback timeout on every read.
+    ///
+    /// POP3 only collects, so the bytes can only travel from a maildrop to a
+    /// collector. The near end is therefore the maildrop, serving the
+    /// payload as its one message, and the far end the collector that takes
+    /// it — and since the far end is the side with the address, the maildrop
+    /// connects to the collector. A socket has no notion of which side
+    /// speaks server; the protocol is the same RFC 1939 either way.
+    #[must_use]
+    pub fn loopback() -> Self {
+        let login = Login {
+            user: "probe".to_string(),
+            password: "probe".to_string(),
+        };
+        Self::new("127.0.0.1:0", login).timing_out_after(LOOPBACK_TIMEOUT)
+    }
+}
+
+/// A bound listener waiting for the one maildrop that connects to be
+/// collected.
+struct Collecting {
+    transport: Pop3Transport,
+    listener: TcpListener,
+    address: String,
+}
+
+impl FarEnd for Collecting {
+    fn address(&self) -> &str {
+        &self.address
+    }
+
+    fn take_one(self: Box<Self>) -> Result<Arrived> {
+        let (stream, peer) = socket::accept_tcp(&self.listener, self.transport.lock.timeout)?;
+        let client = Client::over(stream, &self.transport.lock.login)?;
+        let mut arrived = self.transport.collect(client, &peer.to_string())?;
+        match arrived.len() {
+            1 => Ok(arrived.remove(0)),
+            count => Err(protocol_error(format!(
+                "collected {count} messages, not one"
+            ))),
+        }
+    }
+}
+
+impl Loopback for Pop3Transport {
+    fn far_end(&self) -> Result<Box<dyn FarEnd>> {
+        let (listener, address) = self.bind()?;
+        Ok(Box::new(Collecting {
+            transport: self.clone(),
+            listener,
+            address,
+        }))
+    }
+
+    fn send_to(&self, address: &str, payload: &[u8]) -> Result<()> {
+        let stream = socket::connect_tcp(address, self.lock.timeout)?;
+        let left = Session::over(stream, vec![payload.to_vec()])?.serve()?;
+        if left.is_empty() {
+            Ok(())
+        } else {
+            Err(protocol_error(
+                "the collector left the message in the maildrop",
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,6 +246,44 @@ mod tests {
         Login {
             user: "orders".into(),
             password: "secret".into(),
+        }
+    }
+
+    fn edges() -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            ("empty", Vec::new()),
+            ("one byte", vec![0x2a]),
+            ("every byte", (0..=255).collect()),
+            ("nul run", vec![0; 512]),
+            ("high bytes", vec![0xff; 512]),
+            ("crlf storm", b"\r\n".repeat(400)),
+        ]
+    }
+
+    #[test]
+    fn the_loopback_serves_one_message_and_collects_it() {
+        let message = b"Subject: x\r\n\r\n.dot";
+        let arrived = Pop3Transport::loopback().round(message).expect("round");
+        assert_eq!(arrived.bytes, message);
+        assert!(arrived.origin_uri.starts_with("pop3://127.0.0.1:"));
+        assert!(arrived.origin_uri.ends_with("/msg/1"));
+        let long = vec![0x2a; 100_000];
+        assert_eq!(
+            Pop3Transport::loopback().round(&long).expect("long").bytes,
+            long
+        );
+    }
+
+    #[test]
+    fn the_loopback_returns_the_edge_payloads_whole() {
+        let transport = Pop3Transport::loopback();
+        assert!(transport.ceiling().is_none());
+        for (name, bytes) in edges() {
+            assert!(transport.refuses(&bytes).is_none(), "{name}");
+            let arrived = transport
+                .round(&bytes)
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(arrived.bytes, bytes, "{name}");
         }
     }
 
