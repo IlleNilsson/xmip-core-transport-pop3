@@ -241,23 +241,13 @@ impl Loopback for Pop3Transport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use transport::payload::edge_payloads;
 
     fn login() -> Login {
         Login {
             user: "orders".into(),
             password: "secret".into(),
         }
-    }
-
-    fn edges() -> Vec<(&'static str, Vec<u8>)> {
-        vec![
-            ("empty", Vec::new()),
-            ("one byte", vec![0x2a]),
-            ("every byte", (0..=255).collect()),
-            ("nul run", vec![0; 512]),
-            ("high bytes", vec![0xff; 512]),
-            ("crlf storm", b"\r\n".repeat(400)),
-        ]
     }
 
     #[test]
@@ -278,7 +268,7 @@ mod tests {
     fn the_loopback_returns_the_edge_payloads_whole() {
         let transport = Pop3Transport::loopback();
         assert!(transport.ceiling().is_none());
-        for (name, bytes) in edges() {
+        for (name, bytes) in edge_payloads() {
             assert!(transport.refuses(&bytes).is_none(), "{name}");
             let arrived = transport
                 .round(&bytes)
