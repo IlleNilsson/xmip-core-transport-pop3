@@ -26,7 +26,9 @@ use std::time::Duration;
 
 pub use client::{Client, Login};
 pub use session::Session;
+use transport::arrived::one_arrival;
 use transport::error::{Result, protocol_error};
+use transport::listening::Listening;
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
 use transport::{Arrived, Artefact, Claimed, Directions, ResourceClaim, Transport};
@@ -189,40 +191,19 @@ impl Pop3Transport {
     }
 }
 
-/// A bound listener waiting for the one maildrop that connects to be
-/// collected.
-struct Collecting {
-    transport: Pop3Transport,
-    listener: TcpListener,
-    address: String,
-}
-
-impl FarEnd for Collecting {
-    fn address(&self) -> &str {
-        &self.address
-    }
-
-    fn take_one(self: Box<Self>) -> Result<Arrived> {
-        let (stream, peer) = socket::accept_tcp(&self.listener, self.transport.lock.timeout)?;
-        let client = Client::over(stream, &self.transport.lock.login)?;
-        let mut arrived = self.transport.collect(client, &peer.to_string())?;
-        match arrived.len() {
-            1 => Ok(arrived.remove(0)),
-            count => Err(protocol_error(format!(
-                "collected {count} messages, not one"
-            ))),
-        }
-    }
-}
-
 impl Loopback for Pop3Transport {
+    /// A bound listener waiting for the one maildrop that connects to be
+    /// collected.
     fn far_end(&self) -> Result<Box<dyn FarEnd>> {
-        let (listener, address) = self.bind()?;
-        Ok(Box::new(Collecting {
-            transport: self.clone(),
-            listener,
-            address,
-        }))
+        let transport = self.clone();
+        Ok(Box::new(Listening::new(
+            move |listener: &TcpListener| {
+                let (stream, peer) = socket::accept_tcp(listener, transport.lock.timeout)?;
+                let client = Client::over(stream, &transport.lock.login)?;
+                one_arrival(transport.collect(client, &peer.to_string())?, "collected")
+            },
+            self.bind()?,
+        )))
     }
 
     fn send_to(&self, address: &str, payload: &[u8]) -> Result<()> {
