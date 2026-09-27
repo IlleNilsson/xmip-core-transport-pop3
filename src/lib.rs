@@ -24,14 +24,16 @@ pub mod wire;
 use std::net::TcpListener;
 use std::time::Duration;
 
-pub use client::{Client, Login};
+pub use client::Client;
 pub use session::Session;
 use transport::arrived::one_arrival;
 use transport::error::{Result, protocol_error};
 use transport::listening::Listening;
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
-use transport::{Arrived, Artefact, Claimed, Configured, Directions, ResourceClaim, Transport};
+use transport::{
+    Arrived, Artefact, Claimed, Configured, Directions, Login, ResourceClaim, Transport,
+};
 use xcore::settings::{Applies, Fixed, Kind, Presence, Read, Setting, Settings};
 
 /// Whether a receive deletes each message it retrieved, unless told
