@@ -7,16 +7,9 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 use transport::error::{Result, classify, protocol_error};
-use transport::socket;
+use transport::{Login, socket};
 
 use crate::wire::{expect_ok, read_multiline};
-
-/// What a Location presents when it logs in.
-#[derive(Clone, Debug, Default)]
-pub struct Login {
-    pub user: String,
-    pub password: String,
-}
 
 /// One session in the TRANSACTION state.
 pub struct Client {
