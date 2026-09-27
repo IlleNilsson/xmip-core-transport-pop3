@@ -3,8 +3,8 @@
 
 use std::io::BufRead;
 
-use transport::error::{Result, TransportError, classify, protocol_error};
-use transport::wire::MAX_BODY;
+use net::{MAX_BODY, read};
+use transport::error::{Result, TransportError, protocol_error};
 
 /// One status line.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -18,14 +18,8 @@ pub struct Status {
 /// # Errors
 /// A closed connection, or a line that is neither `+OK` nor `-ERR`.
 pub fn read_status(reader: &mut impl BufRead) -> Result<Status> {
-    let mut line = String::new();
-    let read = reader
-        .read_line(&mut line)
-        .map_err(|e| classify("reading a status line", &e))?;
-    if read == 0 {
-        return Err(protocol_error("the peer closed the connection"));
-    }
-    let line = line.trim_end_matches(['\r', '\n']);
+    let line =
+        read::line(reader)?.ok_or_else(|| protocol_error("the peer closed the connection"))?;
     if let Some(text) = line.strip_prefix("+OK") {
         return Ok(Status {
             ok: true,
