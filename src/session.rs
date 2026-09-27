@@ -6,7 +6,7 @@
 //! QUIT, as the protocol says, so a client that drops mid-session loses
 //! nothing.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
@@ -61,17 +61,11 @@ impl Session {
     /// Where the connection broke mid-command.
     pub fn serve(mut self) -> Result<Vec<Vec<u8>>> {
         loop {
-            let mut line = String::new();
-            let read = self
-                .reader
-                .read_line(&mut line)
-                .map_err(|e| classify("reading a command", &e))?;
-            if read == 0 {
+            let Some(line) = net::read::line(&mut self.reader)? else {
                 // Dropped: nothing is committed.
                 return Ok(self.messages);
-            }
-            let line = line.trim_end_matches(['\r', '\n']);
-            let (verb, argument) = line.split_once(' ').unwrap_or((line, ""));
+            };
+            let (verb, argument) = line.split_once(' ').unwrap_or((&line, ""));
             match verb.to_ascii_uppercase().as_str() {
                 "USER" | "PASS" | "NOOP" => self.ok("")?,
                 "STAT" => {
