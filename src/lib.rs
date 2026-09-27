@@ -31,7 +31,12 @@ use transport::error::{Result, protocol_error};
 use transport::listening::Listening;
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
-use transport::{Arrived, Artefact, Claimed, Directions, ResourceClaim, Transport};
+use transport::{Arrived, Artefact, Claimed, Configured, Directions, ResourceClaim, Transport};
+use xcore::settings::{Applies, Fixed, Kind, Presence, Read, Setting, Settings};
+
+/// Whether a receive deletes each message it retrieved, unless told
+/// otherwise.
+const DELETE_AFTER_RETRIEVE: bool = true;
 
 /// The maildrop lock: taken by logging in, released at QUIT.
 ///
@@ -80,7 +85,7 @@ impl Pop3Transport {
         let server = server.into();
         Self {
             server: server.clone(),
-            delete_after_retrieve: true,
+            delete_after_retrieve: DELETE_AFTER_RETRIEVE,
             lock: MaildropLock {
                 server,
                 login,
@@ -171,6 +176,59 @@ impl Transport for Pop3Transport {
     }
 }
 
+impl Configured for Pop3Transport {
+    /// The address is the server's host and port: where a Receive Location
+    /// logs in. POP3 only collects, so every setting is a Receive
+    /// Location's.
+    const SETTINGS: &'static Settings = &Settings {
+        technology: env!("CARGO_PKG_NAME"),
+        settings: &[
+            Setting {
+                name: "user",
+                kind: Kind::Text,
+                presence: Presence::Required,
+                meaning: "The mailbox user a Location logs in as.",
+                applies: Applies::Receive,
+            },
+            Setting {
+                name: "delete_after_retrieve",
+                kind: Kind::Boolean,
+                presence: Presence::Default(Fixed::Boolean(DELETE_AFTER_RETRIEVE)),
+                meaning: "Whether a receive deletes each message it retrieved, at QUIT.",
+                applies: Applies::Receive,
+            },
+            Setting {
+                name: "timeout",
+                kind: Kind::Duration,
+                presence: Presence::Optional,
+                meaning: "How long a server that stops mid-response is waited on; unbounded \
+                          when left out.",
+                applies: Applies::Receive,
+            },
+        ],
+    };
+
+    /// The password comes through the Location's credentials, never a
+    /// setting; the login is built without it.
+    fn configured(address: &str, settings: &Read) -> Result<Self> {
+        let login = Login {
+            user: settings
+                .optional_text("user")
+                .unwrap_or_default()
+                .to_string(),
+            password: String::new(),
+        };
+        let mut transport = Self::new(address, login);
+        if settings.optional_boolean("delete_after_retrieve") == Some(false) {
+            transport = transport.leaving_mail();
+        }
+        if let Some(timeout) = settings.optional_duration("timeout") {
+            transport = transport.timing_out_after(timeout);
+        }
+        Ok(transport)
+    }
+}
+
 impl Pop3Transport {
     /// Both ends on this machine: an ephemeral local port, a probe login,
     /// the loopback timeout on every read.
@@ -229,6 +287,26 @@ mod tests {
             user: "orders".into(),
             password: "secret".into(),
         }
+    }
+
+    #[test]
+    fn pop3_declares_its_settings_and_reads_through_them() {
+        use xcore::settings::Given;
+        assert_eq!(Pop3Transport::SETTINGS.problems(), Vec::<String>::new());
+        let given = [
+            ("user".to_string(), Given::Text("orders".to_string())),
+            ("delete_after_retrieve".to_string(), Given::Boolean(false)),
+            ("timeout".to_string(), Given::Text("2s".to_string())),
+        ];
+        let built = Pop3Transport::open("mail:110", Applies::Receive, &given).expect("built");
+        assert_eq!(built.server, "mail:110");
+        assert_eq!(built.lock.login.user, "orders");
+        assert!(!built.delete_after_retrieve);
+        assert_eq!(built.lock.timeout, Some(Duration::from_secs(2)));
+        let Err(refused) = Pop3Transport::open("mail:110", Applies::Receive, &given[1..]) else {
+            panic!("user is required");
+        };
+        assert!(refused.message.contains("\"user\""), "{}", refused.message);
     }
 
     #[test]
