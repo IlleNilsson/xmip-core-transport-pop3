@@ -162,7 +162,9 @@ impl Transport for Pop3Transport {
     }
 
     /// Every message in the maildrop, each deleted at QUIT unless the
-    /// transport was told to leave them.
+    /// transport was told to leave them. A session of its own each time:
+    /// POP3 fixes the maildrop at login and commits deletes at QUIT, so a
+    /// kept one would see no new mail and remove none.
     fn receive(&self) -> Result<Vec<Arrived>> {
         self.collect(self.connect()?, &self.server)
     }
