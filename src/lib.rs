@@ -3,7 +3,7 @@
 //! Streams that arrive as mail collected over POP3. One message is one
 //! Stream, its number in the maildrop kept beside it.
 //!
-//! POP3 is the receive half of the oldest integration there is: a partner
+//! POP3 is the receive half of the oldest integration there is: a Party
 //! mails an order, and something collects the mailbox. A Receive Location
 //! logs in, lists the maildrop, retrieves every message and deletes what it
 //! retrieved, which POP3 commits at QUIT — so a collection that breaks
