@@ -5,9 +5,10 @@
 //!
 //! POP3 is the receive half of the oldest integration there is: a Party
 //! mails an order, and something collects the mailbox. A Receive Location
-//! logs in, lists the maildrop, retrieves every message and deletes what it
-//! retrieved, which POP3 commits at QUIT — so a collection that breaks
-//! mid-way leaves the maildrop as it was. The send half is SMTP,
+//! logs in, lists the maildrop and hands each message back unread; the
+//! session stays open until every message has its verdict, deletes what was
+//! accepted and quits, which commits the deletes ([`maildrop`]) — so a
+//! collection that breaks mid-way leaves the maildrop as it was. The send half is SMTP,
 //! `xmip-core-transport-smtp`; this transport only receives.
 //!
 //! The maildrop lock is the protocol's own claim, ADR-0024 clause 4: while
@@ -18,6 +19,7 @@
 //! The origin URI carries what the server knew: `pop3://server/msg/1`.
 
 pub mod client;
+pub mod maildrop;
 pub mod session;
 pub mod wire;
 
@@ -25,6 +27,7 @@ use std::net::TcpListener;
 use std::time::Duration;
 
 pub use client::Client;
+pub use maildrop::Maildrop;
 pub use session::Session;
 use transport::arrived::one_arrival;
 use transport::error::{Result, protocol_error};
@@ -36,8 +39,7 @@ use transport::{
 };
 use xcore::settings::{Applies, Fixed, Kind, Presence, Read, Setting, Settings};
 
-/// Whether a receive deletes each message it retrieved, unless told
-/// otherwise.
+/// Whether an accepted message is deleted, unless told otherwise.
 const DELETE_AFTER_RETRIEVE: bool = true;
 
 /// The maildrop lock: taken by logging in, released at QUIT.
@@ -96,7 +98,7 @@ impl Pop3Transport {
         }
     }
 
-    /// Leave retrieved messages in the maildrop rather than deleting them.
+    /// Leave accepted messages in the maildrop rather than deleting them.
     #[must_use]
     pub const fn leaving_mail(mut self) -> Self {
         self.delete_after_retrieve = false;
@@ -135,20 +137,15 @@ impl Pop3Transport {
         Session::accept(listener, messages, self.lock.timeout)
     }
 
-    /// Every message the logged-in client's maildrop holds, each deleted at
-    /// QUIT unless the transport was told to leave them; `server` names the
-    /// origin.
-    fn collect(&self, mut client: Client, server: &str) -> Result<Vec<Arrived>> {
-        let mut arrived = Vec::new();
-        for number in client.numbers()? {
-            let bytes = client.retrieve(number)?;
-            if self.delete_after_retrieve {
-                client.delete(number)?;
-            }
-            arrived.push(Arrived::new(format!("pop3://{server}/msg/{number}"), bytes));
-        }
-        client.quit()?;
-        Ok(arrived)
+    /// Every message the logged-in client's maildrop holds, handed back
+    /// unread on the session held open until each has its verdict
+    /// ([`Maildrop`]); `server` names the origin.
+    fn collect(&self, client: Client, server: &str) -> Result<Vec<Arrived>> {
+        Maildrop::collect(
+            client,
+            |number| format!("pop3://{server}/msg/{number}"),
+            self.delete_after_retrieve,
+        )
     }
 }
 
@@ -161,10 +158,20 @@ impl Transport for Pop3Transport {
         Directions::RECEIVE
     }
 
-    /// Every message in the maildrop, each deleted at QUIT unless the
-    /// transport was told to leave them. A session of its own each time:
-    /// POP3 fixes the maildrop at login and commits deletes at QUIT, so a
-    /// kept one would see no new mail and remove none.
+    fn arrivals(&self) -> transport::Arrivals {
+        transport::Arrivals::Ordered(
+            "the maildrop is locked by the session until every message is told",
+        )
+    }
+
+    /// Every message in the maildrop, handed back unread: each retrieved
+    /// when the runtime first reads it, marked deleted on `Accepted` and on
+    /// `Refused` unless the transport was told to leave mail, left on
+    /// `Failed`, and the
+    /// session quits after the last verdict, committing the deletes. A
+    /// session of its own each receive: POP3 fixes the maildrop at login and
+    /// commits deletes at QUIT, so a kept one would see no new mail and
+    /// remove none.
     fn receive(&self) -> Result<Vec<Arrived>> {
         self.collect(self.connect()?, &self.server)
     }
@@ -198,7 +205,8 @@ impl Configured for Pop3Transport {
                 name: "delete_after_retrieve",
                 kind: Kind::Boolean,
                 presence: Presence::Default(Fixed::Boolean(DELETE_AFTER_RETRIEVE)),
-                meaning: "Whether a receive deletes each message it retrieved, at QUIT.",
+                meaning: "Whether a message is deleted once its receive cycle accepted it, \
+                          committed at QUIT.",
                 applies: Applies::Receive,
             },
             Setting {
@@ -262,7 +270,7 @@ impl Loopback for Pop3Transport {
             move |listener: &TcpListener| {
                 let (stream, peer) = socket::accept_tcp(listener, transport.lock.timeout)?;
                 let client = Client::over(stream, &transport.lock.login)?;
-                one_arrival(transport.collect(client, &peer.to_string())?, "collected")
+                one_arrival(transport.collect(client, &peer.to_string())?, "collected")?.taken()
             },
             self.bind()?,
         )))
@@ -348,7 +356,10 @@ mod tests {
         let collector = std::thread::spawn(move || {
             Pop3Transport::new(address, login())
                 .timing_out_after(Duration::from_secs(2))
-                .receive()
+                .receive()?
+                .into_iter()
+                .map(Arrived::taken)
+                .collect::<Result<Vec<_>>>()
         });
         let messages = vec![
             b"Subject: one\r\n\r\n.dot first".to_vec(),
@@ -368,6 +379,43 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_message_stays_and_a_refused_and_an_accepted_one_are_deleted_at_quit() {
+        let far_end =
+            Pop3Transport::new("127.0.0.1:0", login()).timing_out_after(Duration::from_secs(2));
+        let (listener, address) = far_end.bind().expect("binding");
+        let collector = std::thread::spawn(move || {
+            let mut arrived = Pop3Transport::new(address, login())
+                .timing_out_after(Duration::from_secs(2))
+                .receive()?;
+            assert!(arrived.iter().all(Arrived::defers));
+            // The first read and failed, the second refused, the third
+            // accepted: the last verdict quits.
+            let (_, mut body, acknowledgement) = arrived.remove(0).into_parts();
+            let mut read = Vec::new();
+            std::io::Read::read_to_end(&mut body, &mut read).expect("reading");
+            drop(body);
+            acknowledgement.acknowledge(transport::Verdict::Failed)?;
+            arrived.remove(0).refused(transport::Refusal::Forbidden)?;
+            let accepted = arrived.remove(0).taken()?;
+            Ok::<_, transport::TransportError>((read, accepted))
+        });
+        let messages = vec![
+            b"failed\r\n".to_vec(),
+            b"refused\r\n".to_vec(),
+            b"accepted\r\n".to_vec(),
+        ];
+        let left = far_end
+            .accept_one(&listener, messages.clone())
+            .expect("accepting")
+            .serve()
+            .expect("serving");
+        let (read, accepted) = collector.join().expect("thread").expect("collecting");
+        assert_eq!(read, messages[0]);
+        assert_eq!(accepted.bytes, messages[2]);
+        assert_eq!(left, vec![messages[0].clone()], "only the failed one left");
+    }
+
+    #[test]
     fn leaving_mail_leaves_it_and_send_is_refused() {
         let far_end =
             Pop3Transport::new("127.0.0.1:0", login()).timing_out_after(Duration::from_secs(2));
@@ -376,7 +424,10 @@ mod tests {
             Pop3Transport::new(address, login())
                 .leaving_mail()
                 .timing_out_after(Duration::from_secs(2))
-                .receive()
+                .receive()?
+                .into_iter()
+                .map(Arrived::taken)
+                .collect::<Result<Vec<_>>>()
         });
         let left = far_end
             .accept_one(&listener, vec![b"kept".to_vec()])
