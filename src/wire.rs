@@ -17,7 +17,7 @@ pub struct Status {
 ///
 /// # Errors
 /// A closed connection, or a line that is neither `+OK` nor `-ERR`.
-fn read_status(reader: &mut impl BufRead) -> Result<Status> {
+pub fn read_status(reader: &mut impl BufRead) -> Result<Status> {
     let line =
         read::line(reader)?.ok_or_else(|| protocol_error("the peer closed the connection"))?;
     if let Some(text) = line.strip_prefix("+OK") {
