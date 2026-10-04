@@ -9,7 +9,23 @@ use std::time::Duration;
 use transport::error::{Result, classify, protocol_error};
 use transport::{Login, socket};
 
-use crate::wire::{expect_ok, read_multiline};
+use crate::wire::{expect_ok, read_multiline, read_status};
+
+/// The `n word` lines of a `LIST` or `UIDL` listing.
+fn pairs(listing: &[u8]) -> Result<Vec<(u32, String)>> {
+    String::from_utf8_lossy(listing)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let mut words = line.split_whitespace();
+            let number = words.next().and_then(|n| n.parse().ok());
+            number
+                .zip(words.next())
+                .map(|(number, word)| (number, word.to_string()))
+                .ok_or_else(|| protocol_error(format!("{line:?} is not a listing line")))
+        })
+        .collect()
+}
 
 /// One session in the TRANSACTION state.
 pub struct Client {
@@ -44,24 +60,30 @@ impl Client {
         Ok(client)
     }
 
-    /// The message numbers in the maildrop, from `LIST`.
+    /// Each message in the maildrop by its number in this session, with
+    /// its size in octets, from `LIST`.
     ///
     /// # Errors
     /// Where the server refused or the listing did not read.
-    pub fn numbers(&mut self) -> Result<Vec<u32>> {
+    pub fn listing(&mut self) -> Result<Vec<(u32, String)>> {
         self.say("LIST")?;
         expect_ok(&mut self.reader, "the listing")?;
-        let listing = read_multiline(&mut self.reader)?;
-        String::from_utf8_lossy(&listing)
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(|line| {
-                line.split_whitespace()
-                    .next()
-                    .and_then(|n| n.parse().ok())
-                    .ok_or_else(|| protocol_error(format!("{line:?} is not a listing line")))
-            })
-            .collect()
+        pairs(&read_multiline(&mut self.reader)?)
+    }
+
+    /// Each message in the maildrop by its number in this session, with the
+    /// unique-id `UIDL` gives it: the same in every session, and never
+    /// another message's (RFC 1939 section 7). `None` where the server has
+    /// no `UIDL`, an optional command.
+    ///
+    /// # Errors
+    /// Where the listing did not read.
+    pub fn unique_ids(&mut self) -> Result<Option<Vec<(u32, String)>>> {
+        self.say("UIDL")?;
+        if !read_status(&mut self.reader)?.ok {
+            return Ok(None);
+        }
+        pairs(&read_multiline(&mut self.reader)?).map(Some)
     }
 
     /// Message `number`, whole.

@@ -4,8 +4,10 @@
 //! One maildrop, in memory, one client at a time: the lock RFC 1939 puts on
 //! a maildrop is this session existing. Deletes are marked and committed at
 //! QUIT, as the protocol says, so a client that drops mid-session loses
-//! nothing.
+//! nothing. `UIDL` names each message with a unique-id that every session
+//! over the same messages gives it again, unless [`Session::without_uidl`].
 
+use std::hash::{DefaultHasher, Hasher};
 use std::io::{BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
@@ -20,6 +22,9 @@ pub struct Session {
     writer: TcpStream,
     messages: Vec<Vec<u8>>,
     deleted: Vec<bool>,
+    /// Each message's `UIDL` unique-id, `None` where this maildrop answers
+    /// no `UIDL`, an optional command.
+    ids: Option<Vec<String>>,
 }
 
 impl Session {
@@ -44,14 +49,23 @@ impl Session {
     pub fn over(stream: TcpStream, messages: Vec<Vec<u8>>) -> Result<Self> {
         let (reader, writer) = socket::split(stream)?;
         let deleted = vec![false; messages.len()];
+        let ids = Some(unique_ids(&messages));
         let mut session = Self {
             reader,
             writer,
             messages,
             deleted,
+            ids,
         };
         session.ok("xmip ready")?;
         Ok(session)
+    }
+
+    /// Answer `UIDL` with `-ERR`, as a server without it does.
+    #[must_use]
+    pub fn without_uidl(mut self) -> Self {
+        self.ids = None;
+        self
     }
 
     /// Serve the client until it quits or drops. Returns what the maildrop
@@ -85,6 +99,21 @@ impl Session {
                     self.ok("listing follows")?;
                     self.write(lines.as_bytes())?;
                 }
+                "UIDL" => match self.ids.clone() {
+                    Some(ids) => {
+                        let mut lines = String::new();
+                        for (i, id) in ids.iter().enumerate() {
+                            if !self.deleted[i] {
+                                use std::fmt::Write as _;
+                                let _ = writeln!(lines, "{} {id}\r", i + 1);
+                            }
+                        }
+                        lines.push_str(".\r\n");
+                        self.ok("unique-id listing follows")?;
+                        self.write(lines.as_bytes())?;
+                    }
+                    None => self.err("no UIDL here")?,
+                },
                 "RETR" => match self.index(argument) {
                     Some(i) => {
                         self.ok("message follows")?;
@@ -150,4 +179,22 @@ impl Session {
             .flush()
             .map_err(|e| classify("flushing a response", &e))
     }
+}
+
+/// A unique-id for each of `messages` that every session over the same
+/// messages gives it again: a hash of its bytes, and of how many before it
+/// had the same bytes.
+fn unique_ids(messages: &[Vec<u8>]) -> Vec<String> {
+    let mut seen = std::collections::HashMap::new();
+    messages
+        .iter()
+        .map(|message| {
+            let before = seen.entry(message.as_slice()).or_insert(0_u32);
+            let mut hasher = DefaultHasher::new();
+            hasher.write(message);
+            let id = format!("{:016x}-{before}", hasher.finish());
+            *before += 1;
+            id
+        })
+        .collect()
 }

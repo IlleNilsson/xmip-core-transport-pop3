@@ -8,7 +8,9 @@
 //! logs in, lists the maildrop and hands each message back unread; the
 //! session stays open until every message has its verdict, deletes what was
 //! accepted and quits, which commits the deletes ([`maildrop`]) — so a
-//! collection that breaks mid-way leaves the maildrop as it was. The send half is SMTP,
+//! collection that breaks mid-way leaves the maildrop as it was. A refused
+//! message is left in the maildrop, and this Location does not collect it
+//! again while it lies there unchanged. The send half is SMTP,
 //! `xmip-core-transport-smtp`; this transport only receives.
 //!
 //! The maildrop lock is the protocol's own claim, ADR-0024 clause 4: while
@@ -27,7 +29,7 @@ use std::net::TcpListener;
 use std::time::Duration;
 
 pub use client::Client;
-pub use maildrop::Maildrop;
+pub use maildrop::{Maildrop, RefusedMail};
 pub use session::Session;
 use transport::arrived::one_arrival;
 use transport::error::{Result, protocol_error};
@@ -80,6 +82,9 @@ pub struct Pop3Transport {
     server: String,
     delete_after_retrieve: bool,
     lock: MaildropLock,
+    /// The messages refused and left in the maildrop, shared with the
+    /// acknowledgements a receive handed out.
+    refused: RefusedMail,
 }
 
 impl Pop3Transport {
@@ -95,6 +100,7 @@ impl Pop3Transport {
                 login,
                 timeout: None,
             },
+            refused: RefusedMail::default(),
         }
     }
 
@@ -145,6 +151,7 @@ impl Pop3Transport {
             client,
             |number| format!("pop3://{server}/msg/{number}"),
             self.delete_after_retrieve,
+            &self.refused,
         )
     }
 }
@@ -164,10 +171,10 @@ impl Transport for Pop3Transport {
         )
     }
 
-    /// Every message in the maildrop, handed back unread: each retrieved
-    /// when the runtime first reads it, marked deleted on `Accepted` and on
-    /// `Refused` unless the transport was told to leave mail, left on
-    /// `Failed`, and the
+    /// Every message in the maildrop not refused before as it lies, handed
+    /// back unread: each retrieved when the runtime first reads it, marked
+    /// deleted on `Accepted` unless the transport was told to leave mail,
+    /// left and remembered on `Refused`, left on `Failed`, and the
     /// session quits after the last verdict, committing the deletes. A
     /// session of its own each receive: POP3 fixes the maildrop at login and
     /// commits deletes at QUIT, so a kept one would see no new mail and
@@ -379,7 +386,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_message_stays_and_a_refused_and_an_accepted_one_are_deleted_at_quit() {
+    fn a_failed_and_a_refused_message_stay_and_an_accepted_one_is_deleted_at_quit() {
         let far_end =
             Pop3Transport::new("127.0.0.1:0", login()).timing_out_after(Duration::from_secs(2));
         let (listener, address) = far_end.bind().expect("binding");
@@ -412,7 +419,85 @@ mod tests {
         let (read, accepted) = collector.join().expect("thread").expect("collecting");
         assert_eq!(read, messages[0]);
         assert_eq!(accepted.bytes, messages[2]);
-        assert_eq!(left, vec![messages[0].clone()], "only the failed one left");
+        assert_eq!(
+            left,
+            vec![messages[0].clone(), messages[1].clone()],
+            "the refused message is the only copy, and is left in the maildrop"
+        );
+    }
+
+    /// One receive by `near` from `far_end` serving `messages` — answering
+    /// no `UIDL` unless `uidl` — each message read and refused where it
+    /// begins `refused`, accepted otherwise: what the maildrop holds after,
+    /// and what was read.
+    fn round(
+        far_end: &Pop3Transport,
+        listener: &TcpListener,
+        near: &Pop3Transport,
+        messages: &[&[u8]],
+        uidl: bool,
+    ) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let near = near.clone();
+        let collector = std::thread::spawn(move || {
+            let mut read = Vec::new();
+            for arrived in near.receive()? {
+                let (_, mut body, acknowledgement) = arrived.into_parts();
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut body, &mut bytes).expect("reading");
+                drop(body);
+                let verdict = if bytes.starts_with(b"refused") {
+                    transport::Verdict::Refused(transport::Refusal::Forbidden)
+                } else {
+                    transport::Verdict::Accepted
+                };
+                acknowledgement.acknowledge(verdict)?;
+                read.push(bytes);
+            }
+            Ok::<_, transport::TransportError>(read)
+        });
+        let messages = messages.iter().map(|m| m.to_vec()).collect();
+        let session = far_end.accept_one(listener, messages).expect("accepting");
+        let session = if uidl {
+            session
+        } else {
+            session.without_uidl()
+        };
+        let left = session.serve().expect("serving");
+        (left, collector.join().expect("thread").expect("collecting"))
+    }
+
+    #[test]
+    fn a_refused_message_stays_and_is_not_collected_again_while_it_lies_unchanged() {
+        const REFUSED: &[u8] = b"refused\r\n";
+        // As long as the refused one: one size, another message.
+        const ANOTHER: &[u8] = b"another\r\n";
+        const ONE: &[u8] = b"one\r\n";
+        let wait = Duration::from_secs(2);
+        for uidl in [true, false] {
+            let far_end = Pop3Transport::new("127.0.0.1:0", login()).timing_out_after(wait);
+            let (listener, address) = far_end.bind().expect("binding");
+            let near = Pop3Transport::new(address, login()).timing_out_after(wait);
+            let (left, read) = round(&far_end, &listener, &near, &[REFUSED, ONE], uidl);
+            assert_eq!(read, [REFUSED, ONE], "uidl {uidl}");
+            assert_eq!(left, [REFUSED], "uidl {uidl}: the refused one stays");
+            let (left, read) = round(&far_end, &listener, &near, &[REFUSED, ANOTHER], uidl);
+            assert_eq!(
+                read,
+                [ANOTHER],
+                "uidl {uidl}: the refused one is not collected again"
+            );
+            assert_eq!(left, [REFUSED], "uidl {uidl}");
+            let (left, read) = round(&far_end, &listener, &near, &[REFUSED], uidl);
+            assert!(read.is_empty(), "uidl {uidl}");
+            assert_eq!(left, [REFUSED], "uidl {uidl}");
+            // A node started again remembers nothing: collected once more.
+            let restarted = Pop3Transport::new(near.server.clone(), login()).timing_out_after(wait);
+            let (left, read) = round(&far_end, &listener, &restarted, &[REFUSED], uidl);
+            assert_eq!(
+                (left, read),
+                (vec![REFUSED.to_vec()], vec![REFUSED.to_vec()])
+            );
+        }
     }
 
     #[test]
