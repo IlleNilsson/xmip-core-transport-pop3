@@ -31,6 +31,7 @@ use std::time::Duration;
 pub use client::Client;
 pub use maildrop::{Maildrop, RefusedMail};
 pub use session::Session;
+use transport::ArrivalIdentity;
 use transport::arrived::one_arrival;
 use transport::error::{Result, protocol_error};
 use transport::listening::Listening;
@@ -269,6 +270,12 @@ impl Pop3Transport {
 }
 
 impl Loopback for Pop3Transport {
+    fn arrival_identity(&self) -> ArrivalIdentity {
+        ArrivalIdentity::Unnamed(
+            "a mail names its sender in itself, a message identity; the peer is the server",
+        )
+    }
+
     /// A bound listener waiting for the one maildrop that connects to be
     /// collected.
     fn far_end(&self) -> Result<Box<dyn FarEnd>> {
