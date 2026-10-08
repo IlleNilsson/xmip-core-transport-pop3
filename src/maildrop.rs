@@ -109,7 +109,7 @@ impl Maildrop {
                 };
                 let maildrop = Arc::clone(&maildrop);
                 let body = fetched(move || maildrop.with(|client| client.retrieve(number)));
-                Arrived::new(origin(number), body, told)
+                Arrived::new(origin(number), body, told).detected()
             })
             .collect())
     }
