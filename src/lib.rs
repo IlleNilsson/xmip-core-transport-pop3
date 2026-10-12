@@ -172,6 +172,10 @@ impl Transport for Pop3Transport {
         )
     }
 
+    fn waiting(&self) -> transport::Waiting {
+        transport::Waiting::Polled("a session lists the maildrop and returns")
+    }
+
     /// Every message in the maildrop not refused before as it lies, handed
     /// back unread: each retrieved when the runtime first reads it, marked
     /// deleted on `Accepted` unless the transport was told to leave mail,
