@@ -47,8 +47,9 @@ pub struct Maildrop {
 }
 
 impl Maildrop {
-    /// Every message `client` lists that `refused` does not hold as it
-    /// lies, as arrivals from `origin` of each number, deleted on
+    /// At most `most` of the messages `client` lists that `refused` does not
+    /// hold as they lie — the rest left in the maildrop for a later session
+    /// — as arrivals from `origin` of each number, deleted on
     /// `Accepted` where `delete` says and remembered in `refused` on
     /// `Refused`; the session quits at once where there are none, and after
     /// the last verdict otherwise.
@@ -57,6 +58,7 @@ impl Maildrop {
     /// Where the listing failed, or an empty maildrop could not be left.
     pub fn collect(
         mut client: Client,
+        most: usize,
         origin: impl Fn(u32) -> String,
         delete: bool,
         refused: &RefusedMail,
@@ -79,6 +81,7 @@ impl Maildrop {
                 }
             },
         );
+        let listed: Vec<_> = listed.into_iter().take(most).collect();
         if listed.is_empty() {
             client.quit()?;
             return Ok(Vec::new());
