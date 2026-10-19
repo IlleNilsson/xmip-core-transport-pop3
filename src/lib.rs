@@ -147,9 +147,10 @@ impl Pop3Transport {
     /// Every message the logged-in client's maildrop holds, handed back
     /// unread on the session held open until each has its verdict
     /// ([`Maildrop`]); `server` names the origin.
-    fn collect(&self, client: Client, server: &str) -> Result<Vec<Arrived>> {
+    fn collect(&self, client: Client, server: &str, most: usize) -> Result<Vec<Arrived>> {
         Maildrop::collect(
             client,
+            most,
             |number| format!("pop3://{server}/msg/{number}"),
             self.delete_after_retrieve,
             &self.refused,
@@ -184,11 +185,15 @@ impl Transport for Pop3Transport {
     /// session of its own each receive: POP3 fixes the maildrop at login and
     /// commits deletes at QUIT, so a kept one would see no new mail and
     /// remove none.
-    fn receive(&self) -> Result<Vec<Arrived>> {
-        self.collect(self.connect()?, &self.server)
+    fn receive_up_to(&self, most: usize) -> Result<Vec<Arrived>> {
+        self.collect(self.connect()?, &self.server, most)
     }
 
-    fn send(&self, _target: &str, _bytes: &[u8]) -> Result<()> {
+    fn sending(&self) -> transport::Sending {
+        transport::Sending::Streamed("nothing is sent, so nothing is held: POP3 only collects")
+    }
+
+    fn send_from(&self, _target: &str, _outgoing: transport::Outgoing<'_>) -> Result<()> {
         Err(transport::TransportError::permanent(
             "POP3 only collects; sending mail is xmip-core-transport-smtp",
         ))
@@ -288,7 +293,11 @@ impl Loopback for Pop3Transport {
             move |listener: &TcpListener| {
                 let (stream, peer) = socket::accept_tcp(listener, transport.lock.timeout)?;
                 let client = Client::over(stream, &transport.lock.login)?;
-                one_arrival(transport.collect(client, &peer.to_string())?, "collected")?.taken()
+                one_arrival(
+                    transport.collect(client, &peer.to_string(), 1)?,
+                    "collected",
+                )?
+                .taken()
             },
             self.bind()?,
         )))
