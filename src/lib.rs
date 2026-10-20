@@ -38,7 +38,7 @@ use transport::listening::Listening;
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
 use transport::{
-    Arrived, Artefact, Claimed, Configured, Directions, Login, ResourceClaim, Transport,
+    Arrived, Artifact, Claimed, Configured, Directions, Login, ResourceClaim, Transport,
 };
 use xcore::settings::{Applies, Fixed, Kind, Presence, Read, Setting, Settings};
 
@@ -58,7 +58,7 @@ pub struct MaildropLock {
 }
 
 impl ResourceClaim for MaildropLock {
-    fn is_available(&self, _artefact: &Artefact) -> Result<bool> {
+    fn is_available(&self, _artifact: &Artifact) -> Result<bool> {
         match Client::connect(&self.server, &self.login, self.timeout) {
             Ok(client) => client.quit().map(|()| true),
             Err(error) if error.retryable => Err(error),
@@ -66,11 +66,11 @@ impl ResourceClaim for MaildropLock {
         }
     }
 
-    fn claim(&self, artefact: &Artefact) -> Result<Claimed> {
+    fn claim(&self, artifact: &Artifact) -> Result<Claimed> {
         // The lock is held by the session that collects; a claim outside one
         // is a check that it can be taken.
         Client::connect(&self.server, &self.login, self.timeout)?.quit()?;
-        Ok(Claimed::new(artefact.clone(), "maildrop".to_string()))
+        Ok(Claimed::new(artifact.clone(), "maildrop".to_string()))
     }
 
     fn release(&self, _claimed: Claimed) -> Result<()> {
