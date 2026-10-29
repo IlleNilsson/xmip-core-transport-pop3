@@ -237,6 +237,9 @@ impl Configured for Pop3Transport {
         ],
     };
 
+    /// The schemes a Location's address is entered with to choose this technology.
+    const SCHEMES: &'static [&'static str] = &["pop3"];
+
     /// The password comes through the Location's credentials, never a
     /// setting; the login is built without it.
     fn configured(address: &str, settings: &Read) -> Result<Self> {
