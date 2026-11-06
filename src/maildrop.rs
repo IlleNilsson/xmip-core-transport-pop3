@@ -25,7 +25,8 @@
 //! process's: a node started again collects it once more.
 
 use std::hash::{DefaultHasher, Hasher};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
+use xcore::lock::Locked;
 
 use transport::body::fetched;
 use transport::error::{Result, protocol_error};
@@ -141,7 +142,7 @@ impl Maildrop {
     }
 
     fn client(&self) -> MutexGuard<'_, Option<Client>> {
-        self.client.lock().unwrap_or_else(PoisonError::into_inner)
+        self.client.locked()
     }
 
     fn with<T>(&self, act: impl FnOnce(&mut Client) -> Result<T>) -> Result<T> {
