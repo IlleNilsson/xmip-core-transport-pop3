@@ -112,13 +112,6 @@ impl Pop3Transport {
         self
     }
 
-    /// Give up on a server that stops mid-response.
-    #[must_use]
-    pub const fn timing_out_after(mut self, timeout: Duration) -> Self {
-        self.lock.timeout = Some(timeout);
-        self
-    }
-
     /// Connect and log in.
     ///
     /// # Errors
@@ -226,19 +219,21 @@ impl Configured for Pop3Transport {
                           committed at QUIT.",
                 applies: Applies::Receive,
             },
-            Setting {
-                name: "timeout",
-                kind: Kind::Duration,
-                presence: Presence::Optional,
-                meaning: "How long a server that stops mid-response is waited on; unbounded \
-                          when left out.",
-                applies: Applies::Receive,
-            },
+            transport::configured::timeout(
+                Applies::Receive,
+                None,
+                "How long a server that stops mid-response is waited on; unbounded \
+                 when left out.",
+            ),
         ],
     };
 
     /// The schemes a Location's address is entered with to choose this technology.
     const SCHEMES: &'static [&'static str] = &["pop3"];
+
+    fn timeout_kept(&mut self) -> Option<&mut dyn transport::configured::TimeoutKept> {
+        Some(&mut self.lock.timeout)
+    }
 
     /// The password comes through the Location's credentials, never a
     /// setting; the login is built without it.
@@ -253,9 +248,6 @@ impl Configured for Pop3Transport {
         let mut transport = Self::new(address, login);
         if settings.optional_boolean("delete_after_retrieve") == Some(false) {
             transport = transport.leaving_mail();
-        }
-        if let Some(timeout) = settings.optional_duration("timeout") {
-            transport = transport.timing_out_after(timeout);
         }
         Ok(transport)
     }
