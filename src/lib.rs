@@ -30,6 +30,7 @@ use std::time::Duration;
 
 pub use client::Client;
 pub use maildrop::{Maildrop, RefusedMail};
+use net::login::Check;
 pub use session::Session;
 use transport::ArrivalIdentity;
 use transport::arrived::one_arrival;
@@ -53,13 +54,35 @@ const DELETE_AFTER_RETRIEVE: bool = true;
 #[derive(Clone)]
 pub struct MaildropLock {
     server: String,
+    /// Who it logs in as; where its Location names a secret, the secret's
+    /// password replaces the password here at each login.
     login: Login,
+    /// The secret its Location names, read at each login (ADR-0019,
+    /// amendment 2026-11-25).
+    secret: Option<transport::Secured>,
     timeout: Option<Duration>,
+}
+
+impl MaildropLock {
+    /// The login presented now: the password the Location's secret holds,
+    /// read where it names one.
+    ///
+    /// # Errors
+    /// Where the secret is not set, is no password, or could not be read.
+    fn presented(&self) -> Result<Login> {
+        transport::secured::logged_in(&self.login, self.secret.as_ref(), "pop3")
+    }
+
+    /// Connect and log in, taking the maildrop lock: each session reads the
+    /// Location's secret anew.
+    fn connect(&self) -> Result<Client> {
+        Client::connect(&self.server, &self.presented()?, self.timeout)
+    }
 }
 
 impl ResourceClaim for MaildropLock {
     fn is_available(&self, _artifact: &Artifact) -> Result<bool> {
-        match Client::connect(&self.server, &self.login, self.timeout) {
+        match self.connect() {
             Ok(client) => client.quit().map(|()| true),
             Err(error) if error.retryable => Err(error),
             Err(_) => Ok(false),
@@ -69,7 +92,7 @@ impl ResourceClaim for MaildropLock {
     fn claim(&self, artifact: &Artifact) -> Result<Claimed> {
         // The lock is held by the session that collects; a claim outside one
         // is a check that it can be taken.
-        Client::connect(&self.server, &self.login, self.timeout)?.quit()?;
+        self.connect()?.quit()?;
         Ok(Claimed::new(artifact.clone(), "maildrop".to_string()))
     }
 
@@ -99,6 +122,7 @@ impl Pop3Transport {
             lock: MaildropLock {
                 server,
                 login,
+                secret: None,
                 timeout: None,
             },
             refused: RefusedMail::default(),
@@ -112,12 +136,14 @@ impl Pop3Transport {
         self
     }
 
-    /// Connect and log in.
+    /// Connect and log in, the password the Location's secret holds read
+    /// now where it names one.
     ///
     /// # Errors
-    /// Where the server could not be reached or refused the login.
+    /// Where the secret could not be presented, or the server could not be
+    /// reached or refused the login.
     pub fn connect(&self) -> Result<Client> {
-        Client::connect(&self.server, &self.lock.login, self.lock.timeout)
+        self.lock.connect()
     }
 
     /// Bind as the far end a collector connects to, and report the address.
@@ -129,12 +155,17 @@ impl Pop3Transport {
     }
 
     /// Accept one collector on an already-bound listener, serving
-    /// `messages`.
+    /// `messages` once `check` admits its login.
     ///
     /// # Errors
     /// Where the connection could not be accepted.
-    pub fn accept_one(&self, listener: &TcpListener, messages: Vec<Vec<u8>>) -> Result<Session> {
-        Session::accept(listener, messages, self.lock.timeout)
+    pub fn accept_one(
+        &self,
+        listener: &TcpListener,
+        messages: Vec<Vec<u8>>,
+        check: Check,
+    ) -> Result<Session> {
+        Session::accept(listener, messages, check, self.lock.timeout)
     }
 
     /// Every message the logged-in client's maildrop holds, handed back
@@ -235,8 +266,8 @@ impl Configured for Pop3Transport {
         Some(&mut self.lock.timeout)
     }
 
-    /// The password comes through the Location's credentials, never a
-    /// setting; the login is built without it.
+    /// The password is the secret the Location names, never a setting; the
+    /// login is built without it.
     fn configured(address: &str, settings: &Read) -> Result<Self> {
         let login = Login {
             user: settings
@@ -250,6 +281,13 @@ impl Configured for Pop3Transport {
             transport = transport.leaving_mail();
         }
         Ok(transport)
+    }
+
+    /// The password the Location's secret holds, as `PASS` for its `user`,
+    /// read at each login.
+    fn secured_by(mut self, secret: transport::Secured) -> Result<Self> {
+        self.lock.secret = Some(secret);
+        Ok(self)
     }
 }
 
@@ -287,7 +325,7 @@ impl Loopback for Pop3Transport {
         Ok(Box::new(Listening::new(
             move |listener: &TcpListener| {
                 let (stream, peer) = socket::accept_tcp(listener, transport.lock.timeout)?;
-                let client = Client::over(stream, &transport.lock.login)?;
+                let client = Client::over(stream, &transport.lock.presented()?)?;
                 one_arrival(
                     transport.collect(client, &peer.to_string(), 1)?,
                     "collected",
@@ -298,9 +336,13 @@ impl Loopback for Pop3Transport {
         )))
     }
 
+    /// A maildrop of its own at `address`, admitting the one login this
+    /// collector presents.
     fn send_to(&self, address: &str, payload: &[u8]) -> Result<()> {
+        let login = self.lock.presented()?;
+        let check = net::login::only(login.user, login.password);
         let stream = socket::connect_tcp(address, self.lock.timeout)?;
-        let left = Session::over(stream, vec![payload.to_vec()])?.serve()?;
+        let left = Session::over(stream, vec![payload.to_vec()], check)?.serve()?;
         if left.is_empty() {
             Ok(())
         } else {
@@ -321,6 +363,12 @@ mod tests {
             user: "orders".into(),
             password: "secret".into(),
         }
+    }
+
+    /// The check a far end admits [`login`] by, and no other.
+    fn admitting() -> Check {
+        let login = login();
+        net::login::only(login.user, login.password)
     }
 
     #[test]
@@ -388,7 +436,7 @@ mod tests {
             b"Subject: two\r\n\r\nline\r\n".to_vec(),
         ];
         let left = far_end
-            .accept_one(&listener, messages.clone())
+            .accept_one(&listener, messages.clone(), admitting())
             .expect("accepting")
             .serve()
             .expect("serving");
@@ -427,7 +475,7 @@ mod tests {
             b"accepted\r\n".to_vec(),
         ];
         let left = far_end
-            .accept_one(&listener, messages.clone())
+            .accept_one(&listener, messages.clone(), admitting())
             .expect("accepting")
             .serve()
             .expect("serving");
@@ -471,7 +519,9 @@ mod tests {
             Ok::<_, transport::TransportError>(read)
         });
         let messages = messages.iter().map(|m| m.to_vec()).collect();
-        let session = far_end.accept_one(listener, messages).expect("accepting");
+        let session = far_end
+            .accept_one(listener, messages, admitting())
+            .expect("accepting");
         let session = if uidl {
             session
         } else {
@@ -530,7 +580,7 @@ mod tests {
                 .collect::<Result<Vec<_>>>()
         });
         let left = far_end
-            .accept_one(&listener, vec![b"kept".to_vec()])
+            .accept_one(&listener, vec![b"kept".to_vec()], admitting())
             .expect("accepting")
             .serve()
             .expect("serving");
@@ -543,6 +593,61 @@ mod tests {
         assert!(!refused.retryable);
         assert!(!far_end.directions().sends());
         assert!(far_end.claims().is_some());
+    }
+
+    #[test]
+    fn the_password_is_the_locations_secret_read_at_each_login() {
+        use transport::secured::Kept;
+        use xcore::SecretKind::Password;
+        use xcore::settings::Given;
+        let kept = std::sync::Arc::new(Kept::default());
+        let drawn = Kept::drawn();
+        let far_end =
+            Pop3Transport::new("127.0.0.1:0", login()).timing_out_after(Duration::from_secs(2));
+        let (listener, address) = far_end.bind().expect("binding");
+        let given = [
+            ("user".to_string(), Given::Text("orders".to_string())),
+            ("timeout".to_string(), Given::Text("2s".to_string())),
+        ];
+        let near = Pop3Transport::open(&format!("pop3://{address}"), Applies::Receive, &given)
+            .expect("built")
+            .secured_by(kept.secured("partner-x.pop3"))
+            .expect("kept");
+        let unset = near.receive().expect_err("not set");
+        assert!(unset.retryable, "asked again at the next login");
+        assert!(unset.message.contains("is not set"), "{unset}");
+
+        let check = net::login::only("orders", drawn.clone());
+        kept.set("partner-x.pop3", Password, &format!("{drawn}-wrong"));
+        let collecting = near.clone();
+        let collector = std::thread::spawn(move || collecting.receive().err());
+        let left = far_end
+            .accept_one(&listener, vec![b"kept".to_vec()], check.clone())
+            .expect("accepting")
+            .serve()
+            .expect("serving");
+        assert_eq!(left, [b"kept".to_vec()], "nothing is served before a login");
+        let wrong = collector.join().expect("thread").expect("refused");
+        assert!(wrong.message.contains(session::REFUSED), "{wrong}");
+        assert!(!wrong.retryable, "{wrong}");
+
+        kept.set("partner-x.pop3", Password, &drawn);
+        let collecting = near.clone();
+        let collector = std::thread::spawn(move || {
+            collecting
+                .receive()?
+                .into_iter()
+                .map(Arrived::taken)
+                .collect::<Result<Vec<_>>>()
+        });
+        let left = far_end
+            .accept_one(&listener, vec![b"mail".to_vec()], check)
+            .expect("accepting")
+            .serve()
+            .expect("serving");
+        assert!(left.is_empty(), "collected and deleted");
+        let collected = collector.join().expect("thread").expect("collected");
+        assert_eq!(collected[0].bytes, b"mail");
     }
 
     #[test]

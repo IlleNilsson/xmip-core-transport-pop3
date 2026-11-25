@@ -2,7 +2,7 @@
 
 POP3 transport: one collected message is one Stream; a Receive Location takes the maildrop, retrieves and deletes, the deletes committed at QUIT. RFC 1939. A technology of [xmip-core-transport](https://github.com/IlleNilsson/xmip-core-transport).
 
-The login is the transport capability's `Login`.
+The login is the transport capability's `Login`: `USER` the Location's `user`, and `PASS` the password of the secret the Location names, read at each login, the maildrop lock's check among them (ADR-0019, amendment 2026-11-25). Until 2026-11-25 a Location naming a secret was refused as the node started. The far end `Session` is handed a `net::login::Check` and admits a `PASS` only where it admits the user `USER` named, answering any other `-ERR [AUTH]` (RFC 3206) and serving nothing but the login and `QUIT` before; until the same day it took any login.
 
 A receive connects, logs in and quits every time, unlike the broker, SQL and file-share technologies, whose receives keep their session in the capability's pool. That is POP3's own: a session holds the maildrop as it was at login, sees nothing that arrives after, and commits its deletes only at QUIT (RFC 1939 sections 6 and 8), so a kept session would neither find new mail nor ever remove what it retrieved.
 

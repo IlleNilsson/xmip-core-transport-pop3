@@ -6,16 +6,27 @@
 //! QUIT, as the protocol says, so a client that drops mid-session loses
 //! nothing. `UIDL` names each message with a unique-id that every session
 //! over the same messages gives it again, unless [`Session::without_uidl`].
+//!
+//! The login is checked: `PASS` is admitted only where the
+//! [`net::login::Check`] the session was handed admits the user `USER`
+//! named with it, and refused `-ERR [AUTH]` otherwise (RFC 3206), and no
+//! command but the login's and `QUIT` is served until then. Until
+//! 2026-11-25 the session took any login.
 
 use std::hash::{DefaultHasher, Hasher};
 use std::io::{BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
+use net::login::{Check, Offer, Offered};
 use transport::error::{Result, classify};
 use transport::socket;
 
 use crate::wire::write_multiline;
+
+/// What a refused `PASS` is answered: the response code RFC 3206 gives a
+/// login the server does not admit.
+pub const REFUSED: &str = "[AUTH] the user or the password is not admitted";
 
 pub struct Session {
     reader: BufReader<TcpStream>,
@@ -25,28 +36,37 @@ pub struct Session {
     /// Each message's `UIDL` unique-id, `None` where this maildrop answers
     /// no `UIDL`, an optional command.
     ids: Option<Vec<String>>,
+    /// What admits a login.
+    check: Check,
+    /// The user `USER` named, until `PASS` is answered.
+    user: Option<String>,
+    /// Whether a login was admitted: the TRANSACTION state.
+    admitted: bool,
 }
 
 impl Session {
-    /// Accept one client on `listener`, greet it, and serve `messages`.
+    /// Accept one client on `listener`, greet it, and serve `messages` to
+    /// it once `check` admits its login.
     ///
     /// # Errors
     /// Where the connection could not be accepted.
     pub fn accept(
         listener: &TcpListener,
         messages: Vec<Vec<u8>>,
+        check: Check,
         timeout: Option<Duration>,
     ) -> Result<Self> {
         let (stream, _) = socket::accept_tcp(listener, timeout)?;
-        Self::over(stream, messages)
+        Self::over(stream, messages, check)
     }
 
     /// Greet a client over an already-open connection and serve `messages`
-    /// to it — the loopback's maildrop, which connects to its collector.
+    /// to it once `check` admits its login — the loopback's maildrop, which
+    /// connects to its collector.
     ///
     /// # Errors
     /// Where the connection could not be split or greeted.
-    pub fn over(stream: TcpStream, messages: Vec<Vec<u8>>) -> Result<Self> {
+    pub fn over(stream: TcpStream, messages: Vec<Vec<u8>>, check: Check) -> Result<Self> {
         let (reader, writer) = socket::split(stream)?;
         let deleted = vec![false; messages.len()];
         let ids = Some(unique_ids(&messages));
@@ -56,9 +76,36 @@ impl Session {
             messages,
             deleted,
             ids,
+            check,
+            user: None,
+            admitted: false,
         };
         session.ok("xmip ready")?;
         Ok(session)
+    }
+
+    /// `USER` and `PASS`, the login's two commands: `PASS` admitted where
+    /// the check admits the user `USER` named with its password.
+    fn logging_in(&mut self, verb: &str, argument: &str) -> Result<()> {
+        match (verb, self.user.take()) {
+            ("USER", _) => {
+                self.user = Some(argument.to_string());
+                self.ok("")
+            }
+            ("PASS", Some(user)) => {
+                let offered = Offered {
+                    user: &user,
+                    secret: argument,
+                };
+                self.admitted = (self.check)(&Offer::Password(offered));
+                if self.admitted {
+                    self.ok("maildrop locked and ready")
+                } else {
+                    self.err(REFUSED)
+                }
+            }
+            _ => self.err("USER first"),
+        }
     }
 
     /// Answer `UIDL` with `-ERR`, as a server without it does.
@@ -80,8 +127,17 @@ impl Session {
                 return Ok(self.messages);
             };
             let (verb, argument) = line.split_once(' ').unwrap_or((&line, ""));
-            match verb.to_ascii_uppercase().as_str() {
-                "USER" | "PASS" | "NOOP" => self.ok("")?,
+            let verb = verb.to_ascii_uppercase();
+            if !self.admitted && verb != "QUIT" {
+                if verb == "USER" || verb == "PASS" {
+                    self.logging_in(&verb, argument)?;
+                } else {
+                    self.err("log in first")?;
+                }
+                continue;
+            }
+            match verb.as_str() {
+                "NOOP" => self.ok("")?,
                 "STAT" => {
                     let remaining: Vec<&Vec<u8>> = self.live().collect();
                     let octets: usize = remaining.iter().map(|m| m.len()).sum();
