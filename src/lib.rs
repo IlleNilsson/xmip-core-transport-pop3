@@ -19,38 +19,55 @@
 //! transport capability's, ADR-0033.
 //!
 //! The origin URI carries what the server knew: `pop3://server/msg/1`.
+//!
+//! **Built with its `declaration` feature alone** the crate is
+//! [`declaration`], what a Location of it is configured with, and none of
+//! the code above, which is behind the default feature: what the surfaces'
+//! library carries (ADR-0064, amendment 2026-11-26).
 
+#[cfg(feature = "default")]
 pub mod client;
+#[cfg(feature = "declaration")]
+pub mod declaration;
+#[cfg(feature = "default")]
 pub mod maildrop;
+#[cfg(feature = "default")]
 pub mod session;
+#[cfg(feature = "default")]
 pub mod wire;
 
-use std::net::TcpListener;
-use std::time::Duration;
+#[cfg(feature = "default")]
+use std::{net::TcpListener, time::Duration};
 
+#[cfg(feature = "default")]
 pub use client::Client;
+#[cfg(feature = "default")]
+use declaration::DELETE_AFTER_RETRIEVE;
+#[cfg(feature = "default")]
 pub use maildrop::{Maildrop, RefusedMail};
+#[cfg(feature = "default")]
 use net::login::Check;
+#[cfg(feature = "default")]
 pub use session::Session;
-use transport::ArrivalIdentity;
-use transport::arrived::one_arrival;
+#[cfg(feature = "default")]
 use transport::error::{Result, protocol_error};
-use transport::listening::Listening;
+#[cfg(feature = "default")]
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
-use transport::socket;
+#[cfg(feature = "default")]
+use transport::{ArrivalIdentity, arrived::one_arrival, listening::Listening, socket};
+#[cfg(feature = "default")]
 use transport::{
     Arrived, Artifact, Claimed, Configured, Directions, Login, ResourceClaim, Transport,
 };
-use xcore::settings::{Applies, Fixed, Kind, Presence, Read, Setting, Settings};
-
-/// Whether an accepted message is deleted, unless told otherwise.
-const DELETE_AFTER_RETRIEVE: bool = true;
+#[cfg(feature = "default")]
+use xcore::settings::{Read, Settings};
 
 /// The maildrop lock: taken by logging in, released at QUIT.
 ///
 /// A claim over a whole maildrop rather than one message, because that is
 /// what POP3 offers. `is_available` asks by trying to log in, which is the
 /// only question the protocol answers.
+#[cfg(feature = "default")]
 #[derive(Clone)]
 pub struct MaildropLock {
     server: String,
@@ -63,6 +80,7 @@ pub struct MaildropLock {
     timeout: Option<Duration>,
 }
 
+#[cfg(feature = "default")]
 impl MaildropLock {
     /// The login presented now: the password the Location's secret holds,
     /// read where it names one.
@@ -80,6 +98,7 @@ impl MaildropLock {
     }
 }
 
+#[cfg(feature = "default")]
 impl ResourceClaim for MaildropLock {
     fn is_available(&self, _artifact: &Artifact) -> Result<bool> {
         match self.connect() {
@@ -101,6 +120,7 @@ impl ResourceClaim for MaildropLock {
     }
 }
 
+#[cfg(feature = "default")]
 #[derive(Clone)]
 pub struct Pop3Transport {
     server: String,
@@ -111,6 +131,7 @@ pub struct Pop3Transport {
     refused: RefusedMail,
 }
 
+#[cfg(feature = "default")]
 impl Pop3Transport {
     /// Collect from `server` as `login`.
     #[must_use]
@@ -182,6 +203,7 @@ impl Pop3Transport {
     }
 }
 
+#[cfg(feature = "default")]
 impl Transport for Pop3Transport {
     fn name(&self) -> &'static str {
         "pop3"
@@ -228,39 +250,10 @@ impl Transport for Pop3Transport {
     }
 }
 
+#[cfg(feature = "default")]
 impl Configured for Pop3Transport {
-    /// The address is the server's host and port: where a Receive Location
-    /// logs in. POP3 only collects, so every setting is a Receive
-    /// Location's.
-    const SETTINGS: &'static Settings = &Settings {
-        technology: env!("CARGO_PKG_NAME"),
-        settings: &[
-            Setting {
-                name: "user",
-                kind: Kind::Text,
-                presence: Presence::Required,
-                meaning: "The mailbox user a Location logs in as.",
-                applies: Applies::Receive,
-            },
-            Setting {
-                name: "delete_after_retrieve",
-                kind: Kind::Boolean,
-                presence: Presence::Default(Fixed::Boolean(DELETE_AFTER_RETRIEVE)),
-                meaning: "Whether a message is deleted once its receive cycle accepted it, \
-                          committed at QUIT.",
-                applies: Applies::Receive,
-            },
-            transport::configured::timeout(
-                Applies::Receive,
-                None,
-                "How long a server that stops mid-response is waited on; unbounded \
-                 when left out.",
-            ),
-        ],
-    };
-
-    /// The schemes a Location's address is entered with to choose this technology.
-    const SCHEMES: &'static [&'static str] = &["pop3"];
+    const SETTINGS: &'static Settings = declaration::SETTINGS;
+    const SCHEMES: &'static [&'static str] = declaration::SCHEMES;
 
     fn timeout_kept(&mut self) -> Option<&mut dyn transport::configured::TimeoutKept> {
         Some(&mut self.lock.timeout)
@@ -291,6 +284,7 @@ impl Configured for Pop3Transport {
     }
 }
 
+#[cfg(feature = "default")]
 impl Pop3Transport {
     /// Both ends on this machine: an ephemeral local port, a probe login,
     /// the loopback timeout on every read.
@@ -311,6 +305,7 @@ impl Pop3Transport {
     }
 }
 
+#[cfg(feature = "default")]
 impl Loopback for Pop3Transport {
     fn arrival_identity(&self) -> ArrivalIdentity {
         ArrivalIdentity::Unnamed(
@@ -357,6 +352,7 @@ impl Loopback for Pop3Transport {
 mod tests {
     use super::*;
     use transport::payload::edge_payloads;
+    use xcore::settings::Applies;
 
     fn login() -> Login {
         Login {
